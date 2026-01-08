@@ -1,153 +1,91 @@
 package providers
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/options"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/apis/sessions"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
-	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/requests"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/util/ptr"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	admin "google.golang.org/api/admin/directory/v1"
-	"google.golang.org/api/googleapi"
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 )
 
-// GoogleProvider represents an Google based Identity Provider
+// GoogleProvider represents a Google based Identity Provider with OIDC-compliant ID token verification.
+// This provider uses proper cryptographic verification of ID tokens per the OIDC spec,
+// including signature verification via Google's JWKS, issuer validation, audience validation,
+// and expiration checks.
 type GoogleProvider struct {
-	*ProviderData
+	*OIDCProvider
 
-	RedeemRefreshURL *url.URL
+	// adminService is used to fetch user's groups from Google Admin Directory API if configured.
+	adminService *admin.Service
 
-	// groupValidator is a function that determines if the user in the passed
-	// session is a member of any of the configured Google groups.
-	//
-	// This hits the Google API for each group, so it is called on Redeem &
-	// Refresh. `Authorize` uses the results of this saved in `session.Groups`
-	// Since it is called on every request.
-	groupValidator func(*sessions.SessionState) bool
-
-	setPreferredUsername func(s *sessions.SessionState) error
+	// useOrganizationID indicates whether to use the organization ID from Admin API as preferred username.
+	// If false, the 'name' claim from ID token is used instead.
+	useOrganizationID bool
 }
 
 var _ Provider = (*GoogleProvider)(nil)
 
-type claims struct {
-	Subject       string `json:"sub"`
-	Email         string `json:"email"`
-	EmailVerified bool   `json:"email_verified"`
+const (
+	googleProviderName     = "Google"
+	googleDefaultIssuerURL = "https://accounts.google.com"
+)
+
+// setGoogleDefaults sets Google-specific defaults on the provider config.
+// This is called before provider data is created to ensure proper OIDC discovery.
+func setGoogleDefaults(providerConfig *options.Provider) {
+	if providerConfig.OIDCConfig.IssuerURL == "" {
+		providerConfig.OIDCConfig.IssuerURL = googleDefaultIssuerURL
+	}
 }
 
-const (
-	googleProviderName = "Google"
-	googleDefaultScope = "profile email"
-)
-
-var (
-	// Default Login URL for Google.
-	// Pre-parsed URL of https://accounts.google.com/o/oauth2/auth?access_type=offline.
-	googleDefaultLoginURL = &url.URL{
-		Scheme: "https",
-		Host:   "accounts.google.com",
-		Path:   "/o/oauth2/auth",
-		// to get a refresh token. see https://developers.google.com/identity/protocols/OAuth2WebServer#offline
-		RawQuery: "access_type=offline",
+// NewGoogleProvider initiates a new GoogleProvider with OIDC-compliant ID token verification
+func NewGoogleProvider(p *ProviderData, opts options.GoogleOptions, oidcOpts options.OIDCOptions) *GoogleProvider {
+	// Set Google-specific defaults
+	if p.ProviderName == "" {
+		p.ProviderName = googleProviderName
 	}
 
-	// Default Redeem URL for Google.
-	// pulled from https://accounts.google.com/.well-known/openid-configuration
-	googleDefaultRedeemURL = &url.URL{
-		Scheme: "https",
-		Host:   "oauth2.googleapis.com",
-		Path:   "/token",
-	}
+	// Create the underlying OIDC provider (which sets default scope to "openid email profile")
+	oidcProvider := NewOIDCProvider(p, oidcOpts)
 
-	// Default Validation URL for Google.
-	// https://developers.google.com/identity/sign-in/android/backend-auth#calling-the-tokeninfo-endpoint
-	googleDefaultValidateURL = &url.URL{
-		Scheme: "https",
-		Host:   "oauth2.googleapis.com",
-		Path:   "/tokeninfo",
-	}
-
-	// pulled from https://openidconnect.googleapis.com/v1/userinfo
-	googleDefaultProfileURL = &url.URL{
-		Scheme: "https",
-		Host:   "openidconnect.googleapis.com",
-		Path:   "/v1/userinfo",
-	}
-)
-
-// NewGoogleProvider initiates a new GoogleProvider
-func NewGoogleProvider(p *ProviderData, opts options.GoogleOptions) (*GoogleProvider, error) {
-	p.setProviderDefaults(providerDefaults{
-		name:        googleProviderName,
-		loginURL:    googleDefaultLoginURL,
-		redeemURL:   googleDefaultRedeemURL,
-		profileURL:  googleDefaultProfileURL,
-		validateURL: googleDefaultValidateURL,
-		scope:       googleDefaultScope,
-	})
 	provider := &GoogleProvider{
-		ProviderData: p,
-		// Set a default groupValidator to just always return valid (true), it will
-		// be overwritten if we configured a Google group restriction.
-		groupValidator: func(*sessions.SessionState) bool {
-			return true
-		},
-
-		setPreferredUsername: func(_ *sessions.SessionState) error {
-			return nil
-		},
+		OIDCProvider:      oidcProvider,
+		useOrganizationID: ptr.Deref(opts.UseOrganizationID, options.DefaultGoogleUseOrganizationID),
 	}
 
-	if ptr.Deref(opts.UseOrganizationID, options.DefaultGoogleUseOrganizationID) || opts.ServiceAccountJSON != "" || ptr.Deref(opts.UseApplicationDefaultCredentials, options.DefaultUseApplicationDefaultCredentials) {
-		// reuse admin service to avoid multiple calls for token
-		var adminService *admin.Service
-
-		if ptr.Deref(opts.UseOrganizationID, options.DefaultGoogleUseOrganizationID) {
+	// Set up Google Admin API if configured
+	if opts.ServiceAccountJSON != "" || ptr.Deref(opts.UseApplicationDefaultCredentials, options.DefaultUseApplicationDefaultCredentials) || provider.useOrganizationID {
+		if provider.useOrganizationID {
 			// add user scopes to admin api
 			userScope := getAdminAPIUserScope(opts.AdminAPIUserScope)
 			for index, scope := range possibleScopesList {
 				possibleScopesList[index] = scope + " " + userScope
 			}
-
-			adminService = getAdminService(opts)
-
-			provider.setPreferredUsername = func(s *sessions.SessionState) error {
-				userName, err := getUserInfo(adminService, s.Email)
-				if err != nil {
-					return err
-				}
-				s.PreferredUsername = userName
-				return nil
-			}
 		}
 
-		if opts.ServiceAccountJSON != "" || ptr.Deref(opts.UseApplicationDefaultCredentials, options.DefaultUseApplicationDefaultCredentials) {
-			if adminService == nil {
-				adminService = getAdminService(opts)
-			}
-			provider.configureGroups(opts, adminService)
-		}
+		provider.adminService = getAdminService(opts)
 
+		// Set allowed groups if configured (for authorization checks)
+		if len(opts.Groups) > 0 {
+			p.setAllowedGroups(opts.Groups)
+		}
 	}
-	return provider, nil
+
+	return provider
 }
 
 // by default can be readonly user scope
@@ -161,145 +99,120 @@ func getAdminAPIUserScope(scope string) string {
 	return admin.AdminDirectoryUserReadonlyScope
 }
 
-func (p *GoogleProvider) configureGroups(opts options.GoogleOptions, adminService *admin.Service) {
-	// Backwards compatibility with `--google-group` option
-	if len(opts.Groups) > 0 {
-		p.setAllowedGroups(opts.Groups)
-		p.groupValidator = p.setGroupRestriction(opts.Groups, adminService)
-		return
+// EnrichSession checks the listed Google Groups configured and adds any
+// that the user is a member of to session.Groups.
+// It also sets preferredUsername from the configured source (organization ID or 'name' claim).
+func (p *GoogleProvider) EnrichSession(ctx context.Context, s *sessions.SessionState) error {
+	// First, call the parent OIDC EnrichSession
+	if err := p.OIDCProvider.EnrichSession(ctx, s); err != nil {
+		return err
 	}
 
-	p.groupValidator = p.populateAllGroups(adminService)
+	// Populate session.Groups from Google Admin API
+	if err := p.getGroups(s); err != nil {
+		return err
+	}
+
+	// Set preferredUsername
+	if err := p.setPreferredUsername(s); err != nil {
+		logger.Errorf("failed to set preferred username: %v", err)
+	}
+
+	return nil
 }
 
-func claimsFromIDToken(idToken string) (*claims, error) {
-
-	// id_token is a base64 encode ID token payload
-	// https://developers.google.com/accounts/docs/OAuth2Login#obtainuserinfo
-	jwt := strings.Split(idToken, ".")
-	jwtData := strings.TrimSuffix(jwt[1], "=")
-	b, err := base64.RawURLEncoding.DecodeString(jwtData)
-	if err != nil {
-		return nil, err
+// setPreferredUsername sets the preferred username on the session.
+// If useOrganizationID is true, it fetches the organization ID from Admin API.
+// Otherwise, it extracts the 'name' claim from the ID token.
+func (p *GoogleProvider) setPreferredUsername(s *sessions.SessionState) error {
+	if p.useOrganizationID && p.adminService != nil {
+		userName, err := getUserInfo(p.adminService, s.Email)
+		if err != nil {
+			return err
+		}
+		s.PreferredUsername = userName
+		return nil
 	}
 
-	c := &claims{}
-	err = json.Unmarshal(b, c)
+	extractor, err := p.getClaimExtractor(s.IDToken, s.AccessToken)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("could not get claim extractor: %v", err)
 	}
-	if c.Email == "" {
-		return nil, errors.New("missing email")
+
+	var name string
+	if exists, err := extractor.GetClaimInto("name", &name); err != nil || !exists {
+		return nil
 	}
-	if !c.EmailVerified {
-		return nil, fmt.Errorf("email %s not listed as verified", c.Email)
-	}
-	return c, nil
+
+	s.PreferredUsername = name
+	return nil
 }
 
-// Redeem exchanges the OAuth2 authentication token for an ID token
-func (p *GoogleProvider) Redeem(ctx context.Context, redirectURL, code, codeVerifier string) (*sessions.SessionState, error) {
-	if code == "" {
-		return nil, ErrMissingCode
+// getGroups fetches all groups the user belongs to and populates session.Groups.
+func (p *GoogleProvider) getGroups(s *sessions.SessionState) error {
+	if p.adminService == nil {
+		return nil
 	}
-	clientSecret, err := p.GetClientSecret()
+
+	groups, err := getUserGroups(p.adminService, s.Email)
 	if err != nil {
+		return fmt.Errorf("failed to get user groups for %s: %v", s.Email, err)
+	}
+
+	s.Groups = groups
+	return nil
+}
+
+// RefreshSession uses the RefreshToken to fetch new Access and ID Tokens
+func (p *GoogleProvider) RefreshSession(ctx context.Context, s *sessions.SessionState) (bool, error) {
+	refreshed, err := p.OIDCProvider.RefreshSession(ctx, s)
+	if err != nil || !refreshed {
+		return refreshed, err
+	}
+
+	// Re-populate user's groups from Admin API
+	if err := p.getGroups(s); err != nil {
+		return false, err
+	}
+
+	// Update PreferredUsername
+	if err := p.setPreferredUsername(s); err != nil {
+		logger.Errorf("failed to set preferred username on refresh: %v", err)
+	}
+
+	return true, nil
+}
+
+// CreateSessionFromToken converts Bearer IDTokens into sessions
+func (p *GoogleProvider) CreateSessionFromToken(ctx context.Context, token string) (*sessions.SessionState, error) {
+	ss, err := p.OIDCProvider.CreateSessionFromToken(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("could not create session from token: %v", err)
+	}
+
+	// Populate groups from Google Admin API if configured
+	if err := p.getGroups(ss); err != nil {
 		return nil, err
 	}
 
-	params := url.Values{}
-	params.Add("redirect_uri", redirectURL)
-	params.Add("client_id", p.ClientID)
-	params.Add("client_secret", clientSecret)
-	params.Add("code", code)
-	params.Add("grant_type", "authorization_code")
-	if codeVerifier != "" {
-		params.Add("code_verifier", codeVerifier)
+	// Set preferredUsername
+	if err := p.setPreferredUsername(ss); err != nil {
+		logger.Errorf("failed to set preferred username from bearer token: %v", err)
 	}
-
-	var jsonResponse struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-		IDToken      string `json:"id_token"`
-	}
-
-	err = requests.New(p.RedeemURL.String()).
-		WithContext(ctx).
-		WithMethod("POST").
-		WithBody(bytes.NewBufferString(params.Encode())).
-		SetHeader("Content-Type", "application/x-www-form-urlencoded").
-		Do().
-		UnmarshalInto(&jsonResponse)
-	if err != nil {
-		return nil, err
-	}
-
-	c, err := claimsFromIDToken(jsonResponse.IDToken)
-	if err != nil {
-		return nil, err
-	}
-
-	ss := &sessions.SessionState{
-		AccessToken:  jsonResponse.AccessToken,
-		IDToken:      jsonResponse.IDToken,
-		RefreshToken: jsonResponse.RefreshToken,
-		Email:        c.Email,
-		User:         c.Subject,
-	}
-	ss.CreatedAtNow()
-	ss.ExpiresIn(time.Duration(jsonResponse.ExpiresIn) * time.Second)
 
 	return ss, nil
 }
 
-// EnrichSession checks the listed Google Groups configured and adds any
-// that the user is a member of to session.Groups.
-// if preferred username is configured to be organization ID, it sets that as well.
-func (p *GoogleProvider) EnrichSession(_ context.Context, s *sessions.SessionState) error {
-	// TODO (@NickMeves) - Move to pure EnrichSession logic and stop
-	// reusing legacy `groupValidator`.
-	//
-	// This is called here to get the validator to do the `session.Groups`
-	// populating logic.
-	p.groupValidator(s)
-
-	return p.setPreferredUsername(s)
-}
-
-// SetGroupRestriction configures the GoogleProvider to restrict access to the
-// specified group(s).
-func (p *GoogleProvider) setGroupRestriction(groups []string, adminService *admin.Service) func(*sessions.SessionState) bool {
-	return func(s *sessions.SessionState) bool {
-		// Reset our saved Groups in case membership changed
-		// This is used by `Authorize` on every request
-		s.Groups = make([]string, 0, len(groups))
-		for _, group := range groups {
-			if userInGroup(adminService, group, s.Email) {
-				s.Groups = append(s.Groups, group)
-			}
-		}
-		return len(s.Groups) > 0
+// GetLoginURL makes the LoginURL with optional nonce support
+func (p *GoogleProvider) GetLoginURL(redirectURI, state, nonce string, extraParams url.Values) string {
+	// Add Google-specific parameters for offline access (refresh tokens)
+	if extraParams == nil {
+		extraParams = url.Values{}
 	}
-}
-
-// populateAllGroups configures the GoogleProvider to allow access with all
-// groups and populate session with all groups of the user when no specific
-// groups are configured.
-func (p *GoogleProvider) populateAllGroups(adminService *admin.Service) func(s *sessions.SessionState) bool {
-	return func(s *sessions.SessionState) bool {
-		// Get all groups of the user
-		groups, err := getUserGroups(adminService, s.Email)
-		if err != nil {
-			logger.Errorf("Failed to get user groups for %s: %v", s.Email, err)
-			s.Groups = []string{}
-			return true // Allow access even if we can't get groups
-		}
-
-		// Populate session with all user groups
-		s.Groups = groups
-		return true // Always allow access when no specific groups are configured
+	if extraParams.Get("access_type") == "" {
+		extraParams.Set("access_type", "offline")
 	}
+	return p.OIDCProvider.GetLoginURL(redirectURI, state, nonce, extraParams)
 }
 
 // https://developers.google.com/admin-sdk/directory/reference/rest/v1/members/hasMember#authorization-scopes
@@ -470,100 +383,4 @@ func getUserGroups(service *admin.Service, email string) ([]string, error) {
 	}
 
 	return allGroups, nil
-}
-
-func userInGroup(service *admin.Service, group string, email string) bool {
-	// Use the HasMember API to checking for the user's presence in each group or nested subgroups
-	req := service.Members.HasMember(group, email)
-	r, err := req.Do()
-	if err == nil {
-		return r.IsMember
-	}
-
-	gerr, ok := err.(*googleapi.Error)
-	switch {
-	case ok && gerr.Code == 404:
-		logger.Errorf("error checking membership in group %s: group does not exist", group)
-	case ok && gerr.Code == 400:
-		// It is possible for Members.HasMember to return false even if the email is a group member.
-		// One case that can cause this is if the user email is from a different domain than the group,
-		// e.g. "member@otherdomain.com" in the group "group@mydomain.com" will result in a 400 error
-		// from the HasMember API. In that case, attempt to query the member object directly from the group.
-		req := service.Members.Get(group, email)
-		r, err := req.Do()
-		if err != nil {
-			logger.Errorf("error using get API to check member %s of google group %s: user not in the group", email, group)
-			return false
-		}
-
-		// If the non-domain user is found within the group, still verify that they are "ACTIVE".
-		// Do not count the user as belonging to a group if they have another status ("ARCHIVED", "SUSPENDED", or "UNKNOWN").
-		if r.Status == "ACTIVE" {
-			return true
-		}
-	default:
-		logger.Errorf("error checking group membership: %v", err)
-	}
-	return false
-}
-
-// RefreshSession uses the RefreshToken to fetch new Access and ID Tokens
-func (p *GoogleProvider) RefreshSession(ctx context.Context, s *sessions.SessionState) (bool, error) {
-	if s == nil || s.RefreshToken == "" {
-		return false, nil
-	}
-
-	err := p.redeemRefreshToken(ctx, s)
-	if err != nil {
-		return false, err
-	}
-
-	// TODO (@NickMeves) - Align Group authorization needs with other providers'
-	// behavior in the `RefreshSession` case.
-	//
-	// re-check that the user is in the proper google group(s)
-	if !p.groupValidator(s) {
-		return false, fmt.Errorf("%s is no longer in the group(s)", s.Email)
-	}
-
-	return true, nil
-}
-
-func (p *GoogleProvider) redeemRefreshToken(ctx context.Context, s *sessions.SessionState) error {
-	// https://developers.google.com/identity/protocols/OAuth2WebServer#refresh
-	clientSecret, err := p.GetClientSecret()
-	if err != nil {
-		return err
-	}
-
-	params := url.Values{}
-	params.Add("client_id", p.ClientID)
-	params.Add("client_secret", clientSecret)
-	params.Add("refresh_token", s.RefreshToken)
-	params.Add("grant_type", "refresh_token")
-
-	var data struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int64  `json:"expires_in"`
-		IDToken     string `json:"id_token"`
-	}
-
-	err = requests.New(p.RedeemURL.String()).
-		WithContext(ctx).
-		WithMethod("POST").
-		WithBody(bytes.NewBufferString(params.Encode())).
-		SetHeader("Content-Type", "application/x-www-form-urlencoded").
-		Do().
-		UnmarshalInto(&data)
-	if err != nil {
-		return err
-	}
-
-	s.AccessToken = data.AccessToken
-	s.IDToken = data.IDToken
-
-	s.CreatedAtNow()
-	s.ExpiresIn(time.Duration(data.ExpiresIn) * time.Second)
-
-	return nil
 }

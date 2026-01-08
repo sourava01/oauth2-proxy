@@ -13,6 +13,10 @@ c.out
 *.o
 *.a
 *.so
+google.json
+oauth2.cfg
+cmd/get-user-info/main.go
+header_server.py
 
 # Folders
 _obj
