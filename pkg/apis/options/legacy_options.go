@@ -527,6 +527,7 @@ type LegacyProvider struct {
 	GoogleTargetPrincipal                  string   `flag:"google-target-principal" cfg:"google_target_principal"`
 	GoogleUseOrganizationID                bool     `flag:"google-use-organization-id" cfg:"google_use_organization_id"`
 	GoogleAdminAPIUserScope                string   `flag:"google-admin-api-user-scope" cfg:"google_admin_api_user_scope"`
+	GoogleIncludeOrganizationDetails       bool     `flag:"google-include-organization-details" cfg:"google_include_organization_details"`
 
 	// These options allow for other providers besides Google, with
 	// potential overrides.
@@ -559,6 +560,7 @@ type LegacyProvider struct {
 	AllowedGroups                      []string `flag:"allowed-group" cfg:"allowed_groups"`
 	AllowedRoles                       []string `flag:"allowed-role" cfg:"allowed_roles"`
 	BackendLogoutURL                   string   `flag:"backend-logout-url" cfg:"backend_logout_url"`
+	AdditionalClaims                   []string `flag:"additional-claim" cfg:"additional_claims"`
 
 	AcrValues  string `flag:"acr-values" cfg:"acr_values"`
 	JWTKey     string `flag:"jwt-key" cfg:"jwt_key"`
@@ -628,6 +630,7 @@ func legacyProviderFlagSet() *pflag.FlagSet {
 	flagSet.StringSlice("allowed-group", []string{}, "restrict logins to members of this group (may be given multiple times)")
 	flagSet.StringSlice("allowed-role", []string{}, "(keycloak-oidc) restrict logins to members of these roles (may be given multiple times)")
 	flagSet.String("backend-logout-url", "", "url to perform a backend logout, {id_token} can be used as placeholder for the id_token")
+	flagSet.StringSlice("additional-claim", []string{}, "additional claims to extract from the ID token or userinfo endpoint (may be given multiple times)")
 
 	return flagSet
 }
@@ -642,6 +645,7 @@ func legacyGoogleFlagSet() *pflag.FlagSet {
 	flagSet.String("google-target-principal", "", "the target principal to impersonate when using ADC")
 	flagSet.String("google-use-organization-id", "", "use organization id as preferred username")
 	flagSet.String("google-admin-api-user-scope", "", "authorization scope required to call users.get, can be one of ")
+	flagSet.String("google-include-organization-details", "", "include organization details from Google Admin API in userinfo endpoint")
 
 	return flagSet
 }
@@ -711,6 +715,7 @@ func (l *LegacyProvider) convert() (Providers, error) {
 		CodeChallengeMethod:      l.CodeChallengeMethod,
 		BackendLogoutURL:         l.BackendLogoutURL,
 		AuthRequestResponseMode:  l.AuthRequestResponseMode,
+		AdditionalClaims:         l.AdditionalClaims,
 	}
 
 	// This part is out of the switch section for all providers that support OIDC
@@ -791,6 +796,7 @@ func (l *LegacyProvider) convert() (Providers, error) {
 			TargetPrincipal:                  l.GoogleTargetPrincipal,
 			UseOrganizationID:                &l.GoogleUseOrganizationID,
 			AdminAPIUserScope:                l.GoogleAdminAPIUserScope,
+			IncludeOrganizationDetails:       &l.GoogleIncludeOrganizationDetails,
 		}
 	case "entra-id":
 		provider.MicrosoftEntraIDConfig = MicrosoftEntraIDOptions{

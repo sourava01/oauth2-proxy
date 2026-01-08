@@ -41,6 +41,10 @@ const (
 	// for GoogleOptions.UseOrganizationID
 	DefaultGoogleUseOrganizationID bool = false
 
+	// DefaultGoogleIncludeOrganizationDetails is the default value
+	// for GoogleOptions.IncludeOrganizationDetails
+	DefaultGoogleIncludeOrganizationDetails bool = false
+
 	// DefaultGoogleUseApplicationDefaultCredentials is the default values
 	// for GoogleOptions.UseApplicationDefaultCredentials
 	DefaultUseApplicationDefaultCredentials bool = false
@@ -279,6 +283,8 @@ type GoogleOptions struct {
 	UseOrganizationID *bool `yaml:"useOrganizationID,omitempty"`
 	// admin scope needed for fetching user organization information from admin api, can be one of cloud, user or defaults to readonly
 	AdminAPIUserScope string `yaml:"adminAPIUserScope,omitempty"`
+	// IncludeOrganizationDetails indicates whether to include organization details from Google Admin API in userinfo endpoint
+	IncludeOrganizationDetails *bool `yaml:"includeOrganizationDetails,omitempty"`
 }
 
 type OIDCOptions struct {
@@ -423,5 +429,9 @@ func (g *GoogleOptions) EnsureDefaults() {
 
 	if g.UseApplicationDefaultCredentials == nil {
 		g.UseApplicationDefaultCredentials = ptr.To(DefaultUseApplicationDefaultCredentials)
+	}
+
+	if g.IncludeOrganizationDetails == nil {
+		g.IncludeOrganizationDetails = ptr.To(DefaultGoogleIncludeOrganizationDetails)
 	}
 }

@@ -35,6 +35,9 @@ type GoogleProvider struct {
 	// useOrganizationID indicates whether to use the organization ID from Admin API as preferred username.
 	// If false, the 'name' claim from ID token is used instead.
 	useOrganizationID bool
+
+	// includeOrganizationDetails indicates whether to include organization details from Admin API in userinfo endpoint.
+	includeOrganizationDetails bool
 }
 
 var _ Provider = (*GoogleProvider)(nil)
@@ -63,13 +66,14 @@ func NewGoogleProvider(p *ProviderData, opts options.GoogleOptions, oidcOpts opt
 	oidcProvider := NewOIDCProvider(p, oidcOpts)
 
 	provider := &GoogleProvider{
-		OIDCProvider:      oidcProvider,
-		useOrganizationID: ptr.Deref(opts.UseOrganizationID, options.DefaultGoogleUseOrganizationID),
+		OIDCProvider:               oidcProvider,
+		useOrganizationID:          ptr.Deref(opts.UseOrganizationID, options.DefaultGoogleUseOrganizationID),
+		includeOrganizationDetails: ptr.Deref(opts.IncludeOrganizationDetails, options.DefaultGoogleIncludeOrganizationDetails),
 	}
 
 	// Set up Google Admin API if configured
-	if opts.ServiceAccountJSON != "" || ptr.Deref(opts.UseApplicationDefaultCredentials, options.DefaultUseApplicationDefaultCredentials) || provider.useOrganizationID {
-		if provider.useOrganizationID {
+	if opts.ServiceAccountJSON != "" || ptr.Deref(opts.UseApplicationDefaultCredentials, options.DefaultUseApplicationDefaultCredentials) || provider.useOrganizationID || provider.includeOrganizationDetails {
+		if provider.useOrganizationID || provider.includeOrganizationDetails {
 			// add user scopes to admin api
 			userScope := getAdminAPIUserScope(opts.AdminAPIUserScope)
 			for index, scope := range possibleScopesList {
@@ -118,6 +122,11 @@ func (p *GoogleProvider) EnrichSession(ctx context.Context, s *sessions.SessionS
 		logger.Errorf("failed to set preferred username: %v", err)
 	}
 
+	// Set organization details in AdditionalClaims if configured
+	if err := p.setOrganizationDetails(s); err != nil {
+		logger.Errorf("failed to set organization details: %v", err)
+	}
+
 	return nil
 }
 
@@ -145,6 +154,24 @@ func (p *GoogleProvider) setPreferredUsername(s *sessions.SessionState) error {
 	}
 
 	s.PreferredUsername = name
+	return nil
+}
+
+// setOrganizationDetails fetches organization details from Google Admin API and stores them in AdditionalClaims.
+func (p *GoogleProvider) setOrganizationDetails(s *sessions.SessionState) error {
+	if !p.includeOrganizationDetails || p.adminService == nil {
+		return nil
+	}
+
+	orgDetails, err := getOrganizationDetails(p.adminService, s.Email)
+	if err != nil {
+		return err
+	}
+
+	if s.AdditionalClaims == nil {
+		s.AdditionalClaims = make(map[string]interface{})
+	}
+	s.AdditionalClaims["organizations"] = orgDetails
 	return nil
 }
 
@@ -180,6 +207,11 @@ func (p *GoogleProvider) RefreshSession(ctx context.Context, s *sessions.Session
 		logger.Errorf("failed to set preferred username on refresh: %v", err)
 	}
 
+	// Update organization details
+	if err := p.setOrganizationDetails(s); err != nil {
+		logger.Errorf("failed to set organization details on refresh: %v", err)
+	}
+
 	return true, nil
 }
 
@@ -198,6 +230,11 @@ func (p *GoogleProvider) CreateSessionFromToken(ctx context.Context, token strin
 	// Set preferredUsername
 	if err := p.setPreferredUsername(ss); err != nil {
 		logger.Errorf("failed to set preferred username from bearer token: %v", err)
+	}
+
+	// Set organization details
+	if err := p.setOrganizationDetails(ss); err != nil {
+		logger.Errorf("failed to set organization details from bearer token: %v", err)
 	}
 
 	return ss, nil
@@ -351,6 +388,31 @@ func getUserInfo(service *admin.Service, email string) (string, error) {
 	}
 
 	return "", fmt.Errorf("failed to get organization id for %s", email)
+}
+
+// getOrganizationDetails retrieves organization details from Google Admin API
+func getOrganizationDetails(service *admin.Service, email string) ([]map[string]interface{}, error) {
+	req := service.Users.Get(email)
+	user, err := req.Do()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user details for %s: %v", email, err)
+	}
+
+	orgs, _ := user.Organizations.([]interface{})
+	if len(orgs) == 0 {
+		return nil, nil
+	}
+
+	var result []map[string]interface{}
+	for _, org := range orgs {
+		orgMap, ok := org.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		result = append(result, orgMap)
+	}
+
+	return result, nil
 }
 
 // getUserGroups retrieves all groups that a user is a member of using the Google Admin Directory API
