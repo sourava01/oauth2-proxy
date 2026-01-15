@@ -957,6 +957,7 @@ var _ = Describe("Legacy Options", func() {
 		defaultGoogleOptions := GoogleOptions{
 			UseOrganizationID:                ptr.To(false),
 			UseApplicationDefaultCredentials: ptr.To(false),
+			IncludeOrganizationDetails:       ptr.To(false),
 		}
 
 		defaultLegacyProvider := LegacyProvider{
@@ -1023,6 +1024,7 @@ var _ = Describe("Legacy Options", func() {
 				Groups:                           []string{"1", "2"},
 				UseOrganizationID:                ptr.To(false),
 				UseApplicationDefaultCredentials: ptr.To(false),
+				IncludeOrganizationDetails:       ptr.To(false),
 			},
 			LoginURLParameters:       defaultURLParams,
 			UseSystemTrustStore:      ptr.To(false),

@@ -172,6 +172,7 @@ redirect_url="http://localhost:4180/oauth2/callback"
 					TargetPrincipal:                  "principal",
 					UseOrganizationID:                ptr.To(false),
 					UseApplicationDefaultCredentials: ptr.To(false),
+					IncludeOrganizationDetails:       ptr.To(false),
 				},
 				AzureConfig: options.AzureOptions{
 					Tenant: "common",

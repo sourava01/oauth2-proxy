@@ -403,7 +403,7 @@ func getOrganizationDetails(service *admin.Service, email string) ([]map[string]
 		return nil, nil
 	}
 
-	var result []map[string]interface{}
+	var result []map[string]interface{} //nolint:prealloc // size unknown at compile time
 	for _, org := range orgs {
 		orgMap, ok := org.(map[string]interface{})
 		if !ok {

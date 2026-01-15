@@ -83,6 +83,7 @@ func NewProvider(providerConfig options.Provider) (Provider, error) {
 // setProviderDefaults allows providers to set their defaults before provider data is created.
 // Each provider can implement its own defaults function.
 func setProviderDefaults(providerConfig *options.Provider) {
+	//nolint:gocritic // singleCaseSwitch - switch is preferred for future extensibility
 	switch providerConfig.Type {
 	case options.GoogleProvider:
 		setGoogleDefaults(providerConfig)

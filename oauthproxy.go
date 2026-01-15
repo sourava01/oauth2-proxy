@@ -919,7 +919,7 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 
 	csrf.SetSessionNonce(session)
 	if !p.provider.ValidateSession(req.Context(), session) {
-		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Session validation failed: %s", session)
+		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Session validation failed")
 		p.ErrorPage(rw, req, http.StatusForbidden, "Session validation failed")
 		return
 	}
@@ -934,7 +934,7 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 		logger.Errorf("Error with authorization: %v", err)
 	}
 	if p.Validator(session.Email) && authorized {
-		logger.PrintAuthf(session.Email, req, logger.AuthSuccess, "Authenticated via OAuth2: %s", session)
+		logger.PrintAuthf(session.Email, req, logger.AuthSuccess, "Authenticated via OAuth2")
 		err := p.SaveSession(rw, req, session)
 		if err != nil {
 			logger.Errorf("Error saving session state for %s: %v", remoteAddr, err)
@@ -1135,7 +1135,7 @@ func (p *OAuthProxy) getAuthenticatedSession(rw http.ResponseWriter, req *http.R
 			cause = "invalid email"
 		}
 
-		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authorization via session (%s): removing session %s", cause, session)
+		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authorization via session (%s): removing session", cause)
 		// Invalid session, clear it
 		err := p.ClearSessionCookie(rw, req)
 		if err != nil {
